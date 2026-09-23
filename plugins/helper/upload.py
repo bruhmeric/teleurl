@@ -257,10 +257,24 @@ YTDLP_DOMAINS = {
     "mixcloud.com",
 }
 
-# Domains where cobalt API can be used as an alternative/fallback
+# Domains where cobalt API can be used as an alternative/fallback.
+# Cobalt natively supports these WITHOUT cookies — important because yt-dlp
+# now requires a logged-in cookies.txt for Instagram, TikTok, etc.
+# Reference: https://github.com/imputnet/cobalt (supported services list)
 COBALT_DOMAINS = {
     "youtube.com", "youtu.be",
     "reddit.com", "v.redd.it", "redd.it",
+    # Cobalt can extract these without cookies, unlike yt-dlp:
+    "instagram.com",              # reels, posts, stories
+    "tiktok.com", "vm.tiktok.com",
+    "twitter.com", "x.com", "t.co",
+    "facebook.com", "fb.watch", "fb.com",
+    "pinterest.com", "pin.it",
+    "snapchat.com",
+    "soundcloud.com",
+    "pinterest.ca", "pinterest.co.uk", "pinterest.com.au",
+    "vk.com",
+    "tumblr.com",
 }
 
 
@@ -658,6 +672,35 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 
                 return {"formats": format_results, "title": title}
 
+    # ── Cookie-gated sites WITHOUT cookies → cobalt shortcut ──────────────────
+    # yt-dlp now requires login for Instagram, TikTok, Facebook. If the user
+    # hasn't provided a cookies.txt, yt-dlp will fail; we instead return a
+    # single "best" format entry. The download path will use cobalt for the
+    # actual extraction. This avoids the 10-30s yt-dlp auth timeout.
+    _cobalt_first_fmt = any(d in url.lower() for d in (
+        "instagram.com", "tiktok.com", "vm.tiktok.com",
+        "facebook.com", "fb.watch",
+        "pinterest.com", "pin.it",
+    ))
+    if (
+        _cobalt_first_fmt
+        and Config.COBALT_API_URL
+        and not (Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE))
+    ):
+        Config.LOGGER.info(f"Cookie-gated site — short-circuiting format list to cobalt best: {url[:80]}")
+        return {
+            "formats": [
+                {
+                    "format_id": "cobalt-best",
+                    "resolution": "1080p",
+                    "ext": "mp4",
+                    "filesize": None,
+                    "url": None,
+                }
+            ],
+            "title": "Social Media Video",  # cobalt will set the real title during download
+        }
+
     loop = asyncio.get_running_loop()
 
     def _fetch():
@@ -686,6 +729,19 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 opts["geo_bypass"] = True
                 opts["socket_timeout"] = 20
                 opts["extractor_args"]["pornhub"] = {'prefer_formats': 'mp4'}
+
+            # Cookie-gated sites — fail fast if no cookies, so cobalt can take over.
+            # /api/formats is the Mini App's first call — slow failure here is
+            # the #1 user-perceived "bot is slow" complaint.
+            _cookie_gated_fmt = any(d in url.lower() for d in (
+                "instagram.com", "tiktok.com", "facebook.com", "fb.watch",
+            ))
+            if _cookie_gated_fmt and not (
+                Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE)
+            ):
+                opts["socket_timeout"] = 12
+                opts["retries"] = 1
+                opts["fragment_retries"] = 1
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -1052,6 +1108,22 @@ async def download_ytdlp(
         ydl_opts["geo_bypass"] = True
         ydl_opts["socket_timeout"] = 30
         ydl_opts["extractor_args"] = {'pornhub': {'prefer_formats': 'mp4'}}
+
+    # ── Cookie-gated sites: shorter timeout so we fail fast and let the
+    # cobalt fallback take over. Without cookies, yt-dlp spends 10-30s
+    # hitting Instagram's login wall before raising HTTPError 401.
+    _cookie_gated = any(d in url.lower() for d in (
+        "instagram.com", "tiktok.com", "facebook.com", "fb.watch",
+    ))
+    if _cookie_gated:
+        # If we have a cookies file, give yt-dlp the normal timeout.
+        # If not, fail fast so cobalt fallback runs quickly.
+        if not (Config.COOKIES_FILE and os.path.exists(Config.COOKIES_FILE)):
+            ydl_opts["socket_timeout"] = 12
+            # Don't waste time retrying on auth failures — one shot is enough.
+            ydl_opts["retries"] = 1
+            ydl_opts["fragment_retries"] = 1
+            Config.LOGGER.info(f"Cookie-gated site without cookies.txt — using fast-fail opts for {url[:80]}")
 
     async def _run_async() -> str:
         try:
@@ -1557,6 +1629,39 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         "Accept-Language": "en-US,en;q=0.5"
     }
 
+    # ── Cookie-gated social sites — try Cobalt FIRST ─────────────────────────
+    # yt-dlp now requires logged-in cookies.txt for Instagram, TikTok, etc.
+    # Without cookies, yt-dlp takes 10-30s to fail with login_required, which
+    # makes the bot feel slow. Cobalt supports these without cookies, so try
+    # it FIRST and only fall back to yt-dlp if cobalt is unavailable/fails.
+    # This also fixes the dead-code path below (the sniffer fallback was
+    # unreachable when is_cobalt_url() was False).
+    COBALT_FIRST_DOMAINS = (
+        "instagram.com", "tiktok.com", "vm.tiktok.com",
+        "facebook.com", "fb.watch", "fb.com",
+        "pinterest.com", "pin.it",
+    )
+    try:
+        _host = urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+    except Exception:
+        _host = ""
+    _prefer_cobalt = any(_host == d or _host.endswith("." + d)
+                        for d in COBALT_FIRST_DOMAINS)
+
+    if _prefer_cobalt and Config.COBALT_API_URL:
+        try:
+            status_text = "📥 **Resolving via extraction server…** ⚙️\n_(fast path — no login needed)_"
+            try:
+                await progress_msg.edit_text(status_text, reply_markup=cancel_button(user_id))
+            except Exception:
+                pass
+            return await download_cobalt(url, filename, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
+        except Exception as cobalt_err:
+            if isinstance(cobalt_err, asyncio.CancelledError):
+                raise
+            Config.LOGGER.info(f"Cobalt failed for {_host}: {cobalt_err}; falling back to yt-dlp")
+            # Fall through to yt-dlp below
+
     # ── Route yt-dlp-supported platforms ─────────────────────────────────────
     if is_ytdlp_url(url):
         try:
@@ -1576,47 +1681,48 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
         except Exception as ytdlp_err:
             if isinstance(ytdlp_err, asyncio.CancelledError):
                 raise
-            
-            # If yt-dlp fails and cobalt supports this URL, try cobalt as fallback
-            if is_cobalt_url(url):
-                Config.LOGGER.info(
-                    "Initial extraction failed, trying secondary servers..."
-                )
+
+            # yt-dlp failed. Try in order: cobalt → internal sniffer (link-api).
+            # (Previously this whole branch was a tangled dead-code mess: the
+            # `is_cobalt_url` guard caused the sniffer fallback to be
+            # unreachable. Now we always try cobalt if available, then
+            # always try the sniffer if available, then raise.)
+
+            # Fallback A: Cobalt (covers Instagram/TikTok/etc. without cookies)
+            cobalt_err = None
+            if Config.COBALT_API_URL and is_cobalt_url(url):
+                Config.LOGGER.info("yt-dlp failed; trying cobalt as fallback...")
                 try:
                     return await download_cobalt(url, filename, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
-                except Exception as cobalt_err:
-                    # cobalt also failed — try internal sniffer as last resort
-                    Config.LOGGER.info("Cobalt failed, trying internal sniffer as final fallback...")
-                    try:
-                        link_api_url = await fetch_link_api(url)
-                        if link_api_url:
-                            Config.LOGGER.info(f"Sniffer resolved URL (fallback 1): {link_api_url[:80]}...")
-                            return await download_url(
-                                link_api_url, filename, progress_msg, start_time_ref, user_id, 
-                                format_id=format_id, cancel_ref=cancel_ref
-                            )
-                    except Exception as link_api_err:
-                        pass
-                    # All three failed — raise combined error
-                    raise ValueError(
-                        f"Error 1 (yt-dlp): {ytdlp_err}\n\nError 2 (cobalt): {cobalt_err}"
-                    ) from ytdlp_err
-                # yt-dlp failed and cobalt doesn't support this URL.
-                # Try internal sniffer as a second attempt before giving up.
-                Config.LOGGER.info("yt-dlp failed, trying internal sniffer as fallback...")
-                try:
-                    # UPDATED: Use the /grab endpoint for a direct link if possible
-                    link_api_url = await fetch_link_api(url)
-                    if link_api_url:
-                        Config.LOGGER.info(f"Sniffer resolved URL (fallback 2): {link_api_url[:80]}...")
-                        # Recurse with the resolved direct URL
-                        return await download_url(
-                            link_api_url, filename, progress_msg, start_time_ref, user_id, 
-                            format_id=format_id, cancel_ref=cancel_ref
-                        )
-                except Exception:
-                    pass
-                raise ValueError(str(ytdlp_err)) from ytdlp_err
+                except Exception as e:
+                    if isinstance(e, asyncio.CancelledError):
+                        raise
+                    cobalt_err = e
+                    Config.LOGGER.info(f"Cobalt fallback failed: {e}")
+
+            # Fallback B: Internal sniffer / external Link-API
+            link_api_err = None
+            try:
+                Config.LOGGER.info("Trying internal sniffer as last-resort fallback...")
+                link_api_url = await fetch_link_api(url)
+                if link_api_url:
+                    Config.LOGGER.info(f"Sniffer resolved: {link_api_url[:80]}...")
+                    return await download_url(
+                        link_api_url, filename, progress_msg, start_time_ref, user_id,
+                        format_id=format_id, cancel_ref=cancel_ref
+                    )
+            except Exception as e:
+                if isinstance(e, asyncio.CancelledError):
+                    raise
+                link_api_err = e
+
+            # All paths failed — raise a combined error
+            parts = [f"yt-dlp: {ytdlp_err}"]
+            if cobalt_err:
+                parts.append(f"cobalt: {cobalt_err}")
+            if link_api_err:
+                parts.append(f"sniffer: {link_api_err}")
+            raise ValueError("All extractors failed — " + " | ".join(parts)) from ytdlp_err
 
     # Secondary extraction route: Force Cobalt for skipped yt-dlp domains (e.g. YouTube)
     if is_cobalt_url(url):
