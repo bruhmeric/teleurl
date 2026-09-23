@@ -1,609 +1,248 @@
-"""Zero-Knowledge Image Vault - Telegram bot.
-
-Flow
-----
-1. The owner (or any member of the preview channel) sends an image to the
-   bot in private chat.
-2. The bot downloads it straight into RAM, encrypts it with a fresh AES-256
-   key (wrapped under an Argon2id-derived master key), stores ONLY ciphertext
-   in SQLite and wipes plaintext from memory.
-3. A heavily pixelated, irreversible mosaic preview is posted to the channel
-   with "View once (60s)" and "One-time link" buttons.
-4. On request:
-     * View      -> decrypt in RAM, send as photo/document with
-                    protect_content=True, auto-delete after VIEW_TTL seconds.
-     * ZK link   -> one-time HTTPS link whose #fragment carries the AES key;
-                    decryption happens in the viewer's browser (WebCrypto).
-                    The server serves ciphertext only.
-     * /burn     -> same as View, then the ciphertext row is shredded.
-
-Nothing is ever written to disk in plaintext.  See README.md for the honest
-trust model (what is and is not protected).
-"""
-from __future__ import annotations
-
+import os
+import subprocess
+import sys
+import threading
 import asyncio
-import io
-import logging
-import secrets
 import time
-from datetime import datetime, timezone
 
-from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import (
-    BufferedInputFile,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+# ── CRITICAL: pin a single asyncio event loop BEFORE any pyrogram import ──
+# Pyrogram's Client.__init__ captures `asyncio.get_event_loop()` at instantiation
+# time (utils/shared.py creates the Client at import time). If we later use
+# `asyncio.run(main())` it creates a *new* loop, and pyrogram's executor ends
+# up bound to the old one → "Future attached to a different loop" RuntimeError.
+#
+# Fix: create and set the event loop explicitly here, then later run main() on
+# the SAME loop with `loop.run_until_complete()` instead of `asyncio.run()`.
+_MAIN_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_MAIN_LOOP)
 
-import config
-from crypto import CryptoError, VaultCrypto, b64url, new_salt, wipe
-from db import Vault
-from preview import fallback_preview, make_mosaic
-from webapp import build_app
+from plugins.config import Config
+import platform
+import zipfile
+import urllib.request
+import atexit
+from pyrogram import Client, idle, filters
+import app  # noqa: F401  (registers FastAPI routes & lifecycle hooks)
 
-log = logging.getLogger("zkvault")
-router = Router()
+from utils.shared import bot_client, WEBAPP_PROGRESS
 
-WELCOME = (
-    "🔐 <b>Zero-Knowledge Image Vault</b>\n\n"
-    "Send me any image — I encrypt it with AES-256-GCM before it touches disk, "
-    "post an irreversible blurred preview to the channel, and keep only ciphertext.\n\n"
-    "<b>Commands</b>\n"
-    "• <code>/get &lt;id&gt;</code> — view-once style: saving &amp; forwarding "
-    f"blocked, gone in {config.VIEW_TTL}s\n"
-    "• <code>/secret &lt;id&gt;</code> — one-time link, decrypted in your <i>browser</i>\n"
-    "• <code>/burn &lt;id&gt;</code> — view once, then shred the ciphertext\n"
-    "• <code>/list</code> · <code>/delete &lt;id&gt;</code> · <code>/wipe</code>\n"
-    "• <code>/publish &lt;id&gt;</code> · <code>/unpublish &lt;id&gt;</code> — channel previews\n"
-    "• <code>/help</code> — trust model"
-)
-
-HELP = (
-    "🔐 <b>How this vault protects you</b>\n\n"
-    "• <b>At rest</b>: every image is sealed with its own AES-256-GCM key. Keys are "
-    "wrapped under a key derived from the master passphrase with Argon2id — the "
-    "passphrase lives only in the server's <code>.env</code>. A stolen "
-    "<code>vault.db</code> is just noise.\n"
-    "• <b>In memory</b>: plaintext exists only briefly in RAM during encrypt/send "
-    "and is zeroised afterwards. It is never written to disk, logs or temp files.\n"
-    "• <b>Channel</b>: previews are 26-pixel mosaics — the detail no longer exists "
-    "in them, so they cannot be reversed.\n"
-    "• <b>/get</b>: the closest a bot can get to view-once — Telegram's Bot API "
-    "does not let bots send true view-once media, so the photo arrives covered "
-    "by a tap-to-reveal spoiler, with saving/forwarding blocked "
-    f"(<code>protect_content</code>), and is deleted after {config.VIEW_TTL} "
-    "seconds. Telegram's servers do relay it in transit — that is unavoidable "
-    "for in-chat media.\n"
-    "• <b>/secret</b>: the strongest mode. The server hands your browser ciphertext "
-    "plus a key in the URL fragment (never transmitted). Decryption is 100% local "
-    "via WebCrypto; the link works exactly once.\n\n"
-    "⚠️ No system can stop a viewer from photographing their screen with another "
-    "device. Trust the recipient, not just the pipe."
-)
+# Register a global ping handler for diagnostics
+@bot_client.on_message(filters.command("ping") & filters.private)
+async def ping_handler(client, message):
+    print(f"📥 Received /ping from {message.from_user.id} at {time.time()}")
+    await message.reply_text("🏓 Pong! Bot is alive and well.")
 
 
-# --------------------------------------------------------------------------
-# access control
-# --------------------------------------------------------------------------
-
-_MEMBER_OK = {"creator", "administrator", "member"}
-_MEMBER_CACHE: dict[int, tuple[bool, float]] = {}
-_CACHE_TTL_OK = 300      # a confirmed member stays trusted for 5 min
-_CACHE_TTL_DENY = 60     # denials re-check after 1 min (user may have just joined)
-
-
-async def _is_channel_member(bot: Bot, user_id: int) -> bool:
-    """True if the user joined the preview channel (bot must be its admin)."""
-    if not config.CHANNEL_ID:
-        return False
-    now = time.monotonic()
-    hit = _MEMBER_CACHE.get(user_id)
-    if hit:
-        allowed, ts = hit
-        if now - ts < (_CACHE_TTL_OK if allowed else _CACHE_TTL_DENY):
-            return allowed
-    try:
-        member = await bot.get_chat_member(config.CHANNEL_ID, user_id)
-        allowed = member.status in _MEMBER_OK
-    except Exception as exc:
-        log.warning("membership check failed for %s: %s", user_id, exc)
-        allowed = False
-    _MEMBER_CACHE[user_id] = (allowed, now)
-    return allowed
+def run_health_server():
+    """Run the FastAPI app via Uvicorn in a daemon thread.
+    Uses Config.PORT so it works on Render (dynamic PORT) and locally.
+    """
+    from app import app as api_app
+    import uvicorn
+    print(f"🌍 Starting FastAPI health & progress server on 0.0.0.0:{Config.PORT} ...")
+    uvicorn.run(api_app, host="0.0.0.0", port=Config.PORT, log_level="info")
 
 
-def _join_hint() -> str:
-    """Friendly denial that tells people how to unlock access."""
-    if config.ALLOW_CHANNEL_MEMBERS and config.CHANNEL_ID:
-        pretty = (config.CHANNEL_ID if config.CHANNEL_ID.startswith("@")
-                  else "the vault's channel")
-        return (f"🔒 This vault is for members of {pretty}.\n"
-                "Join the channel, then try again 🙌")
-    return "⛔ This vault is private."
+def setup_po_token_server():
+    """
+    Ensure the Node.js PO Token server dependencies are installed dynamically
+    so we don't need to manually check-in node_modules to GitHub.
+    Only run when ENABLE_PO_TOKEN_SERVER=true (default: false on Render free tier
+    to save RAM).
+    """
+    import shutil
+    if not Config.ENABLE_PO_TOKEN_SERVER:
+        print("ℹ️  PO Token server disabled (set ENABLE_PO_TOKEN_SERVER=true to enable).")
+        return None
+
+    if not shutil.which("npm"):
+        print("⚠️ Warning: 'npm' not found. Skipping Node.js PO Token server setup.")
+        return None
+
+    if not os.path.exists("package.json"):
+        print("📦 Initializing package.json for PO Token server...")
+        subprocess.run(["npm", "init", "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if not os.path.exists("node_modules/youtube-po-token-generator") or not os.path.exists("node_modules/express"):
+        print("📦 Installing Express and YouTube PO Token Generator dependencies...")
+        subprocess.run(
+            ["npm", "install", "express", "youtube-po-token-generator"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        print("✅ Node.js dependencies installed.")
+
+    return "po_server.js"
 
 
-# --------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------
-
-def _kb(image_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"👁 View once · {config.VIEW_TTL}s",
-                             callback_data=f"get:{image_id}"),
-        InlineKeyboardButton(text="🕶 One-time link",
-                             callback_data=f"zk:{image_id}"),
-    ]])
-
-
-def _confirm_wipe_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💥 Yes, shred everything", callback_data="wipeall:yes"),
-        InlineKeyboardButton(text="Cancel", callback_data="wipeall:no"),
-    ]])
-
-
-async def _is_allowed(bot: Bot, vault: Vault, user_id: int | None) -> bool:
-    if not user_id:
-        return False
-    if config.OWNER_ID and user_id == config.OWNER_ID:
-        return True
-    if user_id in config.ALLOWED_USER_IDS:
-        return True
-    owner = await vault.get_meta("owner_id")
-    if owner and int(owner) == user_id:
-        return True
-    # join-to-unlock: anyone who joined the preview channel may use the bot
-    if config.ALLOW_CHANNEL_MEMBERS and config.CHANNEL_ID:
-        return await _is_channel_member(bot, user_id)
-    return False
-
-
-async def _try_claim_owner(vault: Vault, user_id: int | None) -> bool:
-    """Bootstrap: with OWNER_ID unset, the first /start becomes the owner."""
-    if not user_id:
-        return False
-    if await vault.get_meta("owner_id"):
-        return False
-    await vault.set_meta("owner_id", str(user_id))
-    log.warning("OWNER bootstrap: user %s claimed this vault. "
-                "Set OWNER_ID in .env to pin it.", user_id)
-    return True
-
-
-async def _expire(bot: Bot, chat_id: int, message_id: int,
-                  ttl: int | None = None) -> None:
-    """Delete a sent photo from Telegram after ttl seconds (with retries)."""
-    await asyncio.sleep(ttl or config.VIEW_TTL)
-    for delay in (0, 2, 10):
-        try:
-            await bot.delete_message(chat_id, message_id)
-            return
-        except Exception:
-            if delay:
-                await asyncio.sleep(delay)
-
-
-async def _remove_channel_post(bot: Bot, vault: Vault, row) -> None:
-    if row["channel_msg_id"] and config.CHANNEL_ID:
-        try:
-            await bot.delete_message(config.CHANNEL_ID, row["channel_msg_id"])
-        except Exception as exc:
-            log.warning("could not delete channel post: %s", exc)
-        await vault.set_channel_msg(row["id"], None)
-
-
-async def _post_preview(bot: Bot, vault: Vault, image_id: str, preview: bytes) -> None:
-    if not config.CHANNEL_ID:
+def maybe_start_aria2():
+    """Start the aria2c RPC daemon if ENABLE_ARIA2=true (default: false on Render)."""
+    if not Config.ENABLE_ARIA2:
+        print("ℹ️  aria2c disabled (set ENABLE_ARIA2=true to enable).")
+        return
+    if not shutil.which("aria2c"):
+        print("⚠️ aria2c not installed; skipping daemon.")
         return
     try:
-        msg = await bot.send_photo(
-            config.CHANNEL_ID,
-            BufferedInputFile(preview, filename="preview.jpg"),
-            caption=f"🔐 <code>#{image_id}</code> · sealed with AES-256-GCM — "
-                    "request to unlock",
-            reply_markup=_kb(image_id),
-            parse_mode="HTML",
-        )
-        await vault.set_channel_msg(image_id, msg.message_id)
-    except Exception as exc:
-        log.warning("channel post failed: %s", exc)
-
-
-# --------------------------------------------------------------------------
-# delivery
-# --------------------------------------------------------------------------
-
-async def _deliver(bot: Bot, vault: Vault, crypto: VaultCrypto, chat_id: int,
-                   image_id: str, *, burn: bool = False) -> bool | str:
-    """Decrypt in RAM and send as a self-deleting photo/document."""
-    row = await vault.get_image(image_id)
-    if row is None:
-        return f"❌ No image <code>#{image_id}</code> in the vault."
-
-    try:
-        pt = crypto.decrypt(image_id, row["nonce"], row["ct"],
-                            row["wrap_nonce"], row["wrapped_key"])
-    except CryptoError as exc:
-        return f"❌ {exc}"
-
-    caption = (f"🔓 #{image_id}" + (" · 🔥 burned after this view" if burn else "")
-               + f"\n👁 one-time view — no saving, no forwarding · "
-                 f"vanishes in {config.VIEW_TTL}s")
-    try:
-        data = BufferedInputFile(bytes(pt), filename=row["filename"] or f"{image_id}.jpg")
-        if row["as_doc"]:
-            sent = await bot.send_document(chat_id, document=data,
-                                           caption=caption, protect_content=True)
-        else:
-            sent = await bot.send_photo(chat_id, photo=data,
-                                        caption=caption, protect_content=True,
-                                        has_spoiler=config.SPOILER_ON_GET)
-    except Exception as exc:
-        log.warning("delivery to %s failed: %s", chat_id, exc)
-        return ("❌ Could not send you the file — open a private chat with me "
-                "first, then try again.")
-    finally:
-        wipe(pt)
-
-    asyncio.create_task(_expire(bot, chat_id, sent.message_id))
-
-    if burn:
-        await vault.delete_image(image_id)
-        await _remove_channel_post(bot, vault, row)
-    return True
-
-
-async def _send_zk_link(bot: Bot, vault: Vault, crypto: VaultCrypto,
-                        chat_id: int, image_id: str) -> bool | str:
-    """Build a one-time link whose #fragment holds the AES key."""
-    if not config.BASE_URL:
-        return "❌ <code>BASE_URL</code> is not configured on the server."
-    row = await vault.get_image(image_id)
-    if row is None:
-        return f"❌ No image <code>#{image_id}</code> in the vault."
-
-    token, exp = await vault.create_link(image_id, config.LINK_TTL)
-    try:
-        dek = crypto.unwrap_key(image_id, row["wrap_nonce"], row["wrapped_key"])
-        url = f"{config.BASE_URL}/v/{token}#{b64url(bytes(dek))}"
-    finally:
-        wipe(dek)
-
-    exp_str = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%H:%M UTC")
-    await bot.send_message(
-        chat_id,
-        f"🕶 <b>Zero-knowledge link</b> · <code>#{image_id}</code>\n"
-        f"Single use · expires at {exp_str}.\n"
-        "The AES key rides in the URL <code>#fragment</code> — browsers never send "
-        "it to the server. Decryption happens in the viewer's browser.\n"
-        "🚫 On the page: right-click, drag, saving, printing and clipboard are "
-        "disabled — it blanks on app switch and after 60 s.\n\n"
-        f"{url}",
-        parse_mode="HTML", protect_content=True, disable_web_page_preview=True)
-    return True
-
-
-# --------------------------------------------------------------------------
-# handlers: lifecycle & upload
-# --------------------------------------------------------------------------
-
-@router.message(CommandStart())
-async def cmd_start(m: Message, bot: Bot, vault: Vault):
-    uid = m.from_user.id if m.from_user else None
-    if not await _is_allowed(bot, vault, uid):
-        if not config.OWNER_ID and await _try_claim_owner(vault, uid):
-            pass  # first user just claimed ownership
-        else:
-            return await m.reply(_join_hint())
-    await m.reply(WELCOME, parse_mode="HTML")
-
-
-@router.message(Command("help"))
-async def cmd_help(m: Message, bot: Bot, vault: Vault):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    await m.reply(HELP, parse_mode="HTML")
-
-
-@router.message(F.photo | F.document)
-async def on_image(m: Message, bot: Bot, vault: Vault, crypto: VaultCrypto):
-    uid = m.from_user.id if m.from_user else None
-    if not await _is_allowed(bot, vault, uid):
-        return await m.reply(_join_hint())
-
-    # -- figure out what was sent ------------------------------------------
-    if m.photo:
-        biggest = m.photo[-1]
-        file_id, mime, filename, as_doc = biggest.file_id, "image/jpeg", None, 0
-        size = biggest.file_size or 0
-    elif m.document and (m.document.mime_type or "").startswith("image/"):
-        d = m.document
-        file_id = d.file_id
-        mime = d.mime_type or "application/octet-stream"
-        filename, as_doc, size = d.file_name, 1, (d.file_size or 0)
-    else:
-        return await m.reply("🤔 That is not an image. Send a photo or an image file.")
-
-    if size > config.MAX_UPLOAD_BYTES:
-        return await m.reply(
-            f"📦 Too large ({size / 1e6:.1f} MB). Telegram caps bot downloads at 20 MB — "
-            "try compressing first.")
-
-    # -- download to RAM, encrypt, wipe -------------------------------------
-    buf = io.BytesIO()
-    await bot.download(file_id, destination=buf)
-    data = bytearray(buf.getvalue())
-    buf.close()
-    if not data:
-        return await m.reply("❌ Download came back empty — try sending the image as a file.")
-
-    image_id = secrets.token_hex(6)
-    try:
-        enc = crypto.encrypt(image_id, bytes(data))
-    except Exception:
-        wipe(data)
-        raise
-    try:
-        preview = await asyncio.to_thread(make_mosaic, bytes(data))
-    except Exception:
-        log.exception("preview generation failed, using placeholder")
-        preview = fallback_preview()
-    finally:
-        wipe(data)
-
-    await vault.add_image({
-        "id": image_id,
-        "ct": enc["ct"],
-        "nonce": enc["nonce"],
-        "wrap_nonce": enc["wrap_nonce"],
-        "wrapped_key": enc["wrapped_key"],
-        "preview": preview,
-        "mime": mime,
-        "filename": filename,
-        "as_doc": as_doc,
-        "size": len(enc["ct"]),
-        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
-
-    await _post_preview(bot, vault, image_id, preview)
-
-    await m.reply_photo(
-        BufferedInputFile(preview, filename="preview.jpg"),
-        caption=(f"🔐 Sealed as <code>#{image_id}</code>\n"
-                 f"AES-256-GCM · {len(enc['ct']) / 1e6:.2f} MB of ciphertext · "
-                 "plaintext already wiped from RAM\n\n"
-                 f"👁 <code>/get {image_id}</code> — view, self-deletes in {config.VIEW_TTL}s\n"
-                 f"🕶 <code>/secret {image_id}</code> — zero-knowledge browser link\n"
-                 f"🔥 <code>/burn {image_id}</code> — view once, then shred"),
-        parse_mode="HTML",
-        reply_markup=_kb(image_id),
-    )
-
-
-# --------------------------------------------------------------------------
-# handlers: commands
-# --------------------------------------------------------------------------
-
-@router.message(Command("get"))
-async def cmd_get(m: Message, command: CommandObject, bot: Bot,
-                  vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    if not command.args:
-        return await m.reply("Usage: <code>/get &lt;id&gt;</code>", parse_mode="HTML")
-    res = await _deliver(bot, vault, crypto, m.chat.id, command.args.strip())
-    if res is not True:
-        await m.reply(res, parse_mode="HTML")
-
-
-@router.message(Command("burn"))
-async def cmd_burn(m: Message, command: CommandObject, bot: Bot,
-                   vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    if not command.args:
-        return await m.reply("Usage: <code>/burn &lt;id&gt;</code>", parse_mode="HTML")
-    res = await _deliver(bot, vault, crypto, m.chat.id, command.args.strip(), burn=True)
-    if res is not True:
-        await m.reply(res, parse_mode="HTML")
-
-
-@router.message(Command("secret"))
-async def cmd_secret(m: Message, command: CommandObject, bot: Bot,
-                     vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    if not command.args:
-        return await m.reply("Usage: <code>/secret &lt;id&gt;</code>", parse_mode="HTML")
-    res = await _send_zk_link(bot, vault, crypto, m.chat.id, command.args.strip())
-    if res is not True:
-        await m.reply(res, parse_mode="HTML")
-
-
-@router.message(Command("list"))
-async def cmd_list(m: Message, bot: Bot, vault: Vault):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    rows = await vault.list_images()
-    if not rows:
-        return await m.reply("🗂 The vault is empty. Send me an image to seal it.")
-    lines = [f"🗂 <b>Vault · {len(rows)} item(s)</b>"]
-    for r in rows:
-        lines.append(
-            f"• <code>#{r['id']}</code> · {r['mime'].removeprefix('image/')} · "
-            f"{r['size'] / 1e6:.2f} MB · {r['created'][:16].replace('T', ' ')}")
-    lines.append("\n/get to view · /secret for a browser link · /burn to view-once")
-    await m.reply("\n".join(lines), parse_mode="HTML")
-
-
-@router.message(Command("delete"))
-async def cmd_delete(m: Message, command: CommandObject, bot: Bot, vault: Vault):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    if not command.args:
-        return await m.reply("Usage: <code>/delete &lt;id&gt;</code>", parse_mode="HTML")
-    image_id = command.args.strip()
-    row = await vault.get_image(image_id)
-    if row is None:
-        return await m.reply(f"❌ No image <code>#{image_id}</code>.")
-    await _remove_channel_post(bot, vault, row)
-    await vault.delete_image(image_id)
-    await m.reply(f"🧹 <code>#{image_id}</code> shredded. Ciphertext is gone.")
-
-
-@router.message(Command("wipe"))
-async def cmd_wipe(m: Message, bot: Bot, vault: Vault):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    n = await vault.count()
-    if n == 0:
-        return await m.reply("🗂 Nothing to wipe.")
-    await m.reply(f"💥 Shred <b>all {n} encrypted item(s)</b>? This cannot be undone.",
-                  parse_mode="HTML", reply_markup=_confirm_wipe_kb())
-
-
-@router.message(Command("publish"))
-async def cmd_publish(m: Message, command: CommandObject, bot: Bot, vault: Vault):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    if not command.args:
-        return await m.reply("Usage: <code>/publish &lt;id&gt;</code>", parse_mode="HTML")
-    image_id = command.args.strip()
-    row = await vault.get_image(image_id)
-    if row is None:
-        return await m.reply(f"❌ No image <code>#{image_id}</code>.")
-    if row["channel_msg_id"]:
-        return await m.reply(f"ℹ️ <code>#{image_id}</code> is already in the channel.")
-    await _post_preview(bot, vault, image_id, row["preview"])
-    await m.reply(f"📢 Preview for <code>#{image_id}</code> posted to the channel.",
-                  parse_mode="HTML")
-
-
-@router.message(Command("unpublish"))
-async def cmd_unpublish(m: Message, command: CommandObject, bot: Bot, vault: Vault):
-    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        return await m.reply(_join_hint())
-    if not command.args:
-        return await m.reply("Usage: <code>/unpublish &lt;id&gt;</code>", parse_mode="HTML")
-    image_id = command.args.strip()
-    row = await vault.get_image(image_id)
-    if row is None:
-        return await m.reply(f"❌ No image <code>#{image_id}</code>.")
-    await _remove_channel_post(bot, vault, row)
-    await m.reply(f"🧹 Channel preview for <code>#{image_id}</code> removed.",
-                  parse_mode="HTML")
-
-
-@router.message()
-async def catch_all(m: Message, bot: Bot, vault: Vault):
-    if await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
-        await m.reply(
-            "🤖 Send me an image to seal it, or use /help.\n"
-            "List what is sealed with /list.")
-    else:
-        await m.reply(_join_hint())
-
-
-# --------------------------------------------------------------------------
-# handlers: inline buttons
-# --------------------------------------------------------------------------
-
-@router.callback_query(F.data.startswith("get:"))
-async def cb_get(cq: CallbackQuery, bot: Bot, vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(bot, vault, cq.from_user.id):
-        return await cq.answer(_join_hint(), show_alert=True)
-    image_id = cq.data.split(":", 1)[1]
-    await cq.answer(f"🔓 Decrypting #{image_id}…")
-    res = await _deliver(bot, vault, crypto, cq.from_user.id, image_id)
-    if res is not True:
-        await bot.send_message(cq.from_user.id, res, parse_mode="HTML")
-
-
-@router.callback_query(F.data.startswith("zk:"))
-async def cb_zk(cq: CallbackQuery, bot: Bot, vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(bot, vault, cq.from_user.id):
-        return await cq.answer(_join_hint(), show_alert=True)
-    image_id = cq.data.split(":", 1)[1]
-    await cq.answer("🕶 Building a one-time link…")
-    res = await _send_zk_link(bot, vault, crypto, cq.from_user.id, image_id)
-    if res is not True:
-        await bot.send_message(cq.from_user.id, res, parse_mode="HTML")
-
-
-@router.callback_query(F.data == "wipeall:yes")
-async def cb_wipe_yes(cq: CallbackQuery, bot: Bot, vault: Vault):
-    if not await _is_allowed(bot, vault, cq.from_user.id):
-        return await cq.answer(_join_hint(), show_alert=True)
-    for row in await vault.list_images(limit=1000):
-        await _remove_channel_post(bot, vault, row)
-    n = await vault.wipe_all()
-    await cq.answer()
-    await cq.message.edit_text(f"💥 Vault wiped — {n} item(s) shredded irrecoverably.")
-
-
-@router.callback_query(F.data == "wipeall:no")
-async def cb_wipe_no(cq: CallbackQuery):
-    await cq.answer()
-    await cq.message.edit_text("🧊 Wipe cancelled. Nothing was deleted.")
-
-
-# --------------------------------------------------------------------------
-# entrypoint
-# --------------------------------------------------------------------------
-
-async def main() -> None:
-    logging.basicConfig(
-        level=config.LOG_LEVEL,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    config.validate()
-    for issue in config.problems():
-        log.warning(issue)
-
-    vault = Vault(config.DB_PATH)
-    await vault.open()
-
-    salt_hex = await vault.get_meta("argon_salt")
-    if not salt_hex:
-        salt_hex = new_salt().hex()
-        await vault.set_meta("argon_salt", salt_hex)
-    crypto = VaultCrypto(config.MASTER_PASSPHRASE, bytes.fromhex(salt_hex))
-
-    bot = Bot(config.BOT_TOKEN)
-    dp = Dispatcher()
-    dp["vault"] = vault
-    dp["crypto"] = crypto
-    dp.include_router(router)
-
-    runner = None
-    if config.BASE_URL:
-        app = build_app(vault)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", config.WEB_PORT)
-        await site.start()
-        log.info("🕶 zero-knowledge viewer listening on :%d (put it behind HTTPS)",
-                 config.WEB_PORT)
-
-    owner = await vault.get_meta("owner_id")
-    log.info("Vault ready: %d sealed item(s) · owner=%s",
-             await vault.count(), owner or config.OWNER_ID or
-             "unclaimed (first /start claims it)")
-
-    try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
-    finally:
-        if runner:
-            await runner.cleanup()
-        await vault.close()
+        aria_cmd = [
+            "aria2c",
+            "--enable-rpc",
+            "--rpc-listen-all=true",
+            "--rpc-allow-origin-all=true",
+            "--max-connection-per-server=16",
+            "--split=16",
+            "--min-split-size=1M",
+            "--max-overall-download-limit=0",
+            "--file-allocation=none",
+            "--max-concurrent-downloads=100",
+            "-D"
+        ]
+        subprocess.Popen(aria_cmd)
+        print("✅ aria2c daemon started with optimized high-concurrency flags.")
+    except Exception as e:
+        print(f"⚠️ Failed to start aria2c daemon: {e}")
 
 
 if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("🚀  URL Uploader Bot — Starting…")
+    print("=" * 60 + "\n")
+
+    # ── Validate required environment variables ──────────────────────────
+    missing = []
+    if not Config.BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not Config.API_ID:
+        missing.append("API_ID")
+    if not Config.API_HASH:
+        missing.append("API_HASH")
+    if missing:
+        print(f"❌ FATAL: Missing required environment variables: {', '.join(missing)}")
+        print("   Set them in .env, in your Render dashboard, or via `export`.")
+        sys.exit(1)
+
+    if not Config.WEBAPP_URL:
+        print(
+            "⚠️  WARNING: WEBAPP_URL is not set and RENDER_EXTERNAL_URL was not "
+            "auto-injected. The Mini App launch button in /start will not work. "
+            "On Render, this is set automatically after the first deploy."
+        )
+    else:
+        print(f"🌐 Mini App URL: {Config.WEBAPP_URL}")
+        if Config.IS_RENDER:
+            print("🚀 Running on Render — keep-alive enabled by default.")
+
+    # Ensure download folder exists and is clean on startup
+    if os.path.exists(Config.DOWNLOAD_LOCATION):
+        import shutil
+        try:
+            shutil.rmtree(Config.DOWNLOAD_LOCATION)
+            print("🧹 Cleaned old DOWNLOADS folder on startup.")
+        except Exception as e:
+            print(f"⚠️ Could not clean DOWNLOADS folder: {e}")
+    os.makedirs(Config.DOWNLOAD_LOCATION, exist_ok=True)
+
+    # Handle cookies from environment variable (useful for cloud deploys)
+    # Cloud env vars may store newlines as literal \n — convert them
+    cookies_data = os.environ.get("COOKIES_DATA", "")
+    if cookies_data:
+        cookies_data = cookies_data.replace("\\n", "\n")
+        try:
+            with open(Config.COOKIES_FILE, "w", encoding="utf-8") as f:
+                f.write(cookies_data)
+            print(f"🍪 Cookies written to {Config.COOKIES_FILE} from COOKIES_DATA env var.")
+        except Exception as e:
+            print(f"❌ Failed to write cookies file: {e}")
+
+    # ── Start Background Services ──────────────────────────────────────────
+
+    # PO Token server (optional, off by default)
+    print("🚀 Starting youtube-po-token-generator (Node.js) server...")
+    po_script = setup_po_token_server()
+    pot_process = None
+    if po_script and os.path.exists(po_script):
+        try:
+            pot_cmd = ["node", po_script]
+            pot_process = subprocess.Popen(
+                pot_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print("✅ Node.js PO Token server started on port 4416.")
+            atexit.register(lambda: pot_process.terminate() if pot_process else None)
+        except Exception as e:
+            print(f"⚠️ Failed to start Node.js PO Token server: {e}")
+
+    # Aria2c daemon (optional, off by default)
+    maybe_start_aria2()
+
+    # Start FastAPI health server in background thread (required by Render/Koyeb)
+    # Health check returns 503 only during shutdown (see app.py); it returns 200
+    # even during startup so Render's deploy probe passes quickly.
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    print(f"🌐 Health server started on port {Config.PORT}")
+
+    # ── Lifecycle: start → mark healthy → idle → shutdown ────────────────
+    async def main():
+        print("🔧 Initializing main coroutine...")
+        print("🔗 Connecting bot client...")
+        await bot_client.start()
+        print("✅ Bot client started.")
+
+        try:
+            me = await bot_client.get_me()
+            print(f"✅ Logged in as: @{me.username}")
+        except Exception as e:
+            print(f"⚠️ Could not get bot info: {e}")
+
+        # Capture the active asyncio loop so FastAPI threads can dispatch tasks to it
+        print("🌀 Capturing event loop...")
+        from app import app as fastapi_app, prune_progress_task, keep_alive_task
+        fastapi_app.bot_loop = asyncio.get_running_loop()
+
+        # Start the background pruning task
+        asyncio.create_task(prune_progress_task())
+        print("🧹 Progress pruning task started.")
+
+        # Start the self-ping keep-alive task (mitigates Render sleep)
+        if Config.KEEP_ALIVE_INTERVAL > 0:
+            asyncio.create_task(keep_alive_task())
+            print(f"💓 Keep-alive task started (interval={Config.KEEP_ALIVE_INTERVAL}s).")
+        else:
+            print("🔕 Keep-alive disabled (KEEP_ALIVE_INTERVAL=0).")
+
+        # Mark health check as ready — Render now knows the bot is fully online
+        fastapi_app.is_ready = True
+        print("🎊 BOT IS ALIVE 🎊 (health check → ready:true)")
+
+        # Use Pyrogram's own idle() — handles SIGTERM/SIGINT properly
+        await idle()
+
+        # Signal received — mark as shutting down
+        print("👋 Bot stopping cleanly. Goodbye!")
+        fastapi_app.is_shutting_down = True
+        await bot_client.stop()
+
+    # Run everything manually since we want more control over start/stop
+    # NOTE: we use the pinned loop from module top (not asyncio.run, which
+    # would create a NEW loop and trigger pyrogram's "Future attached to a
+    # different loop" error). See the comment at the top of this file.
+    print("🎬 Starting event loop...")
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+        _MAIN_LOOP.run_until_complete(main())
+    except Exception as e:
+        print(f"❌ Bot crashed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        # Drain any pending callbacks before closing the loop
+        try:
+            _MAIN_LOOP.run_until_complete(_MAIN_LOOP.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            _MAIN_LOOP.close()
+        except Exception:
+            pass

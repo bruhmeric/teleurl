@@ -118,8 +118,11 @@ async def api_formats(req: FormatsRequest):
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        raise HTTPException(status_code=403, detail="YouTube downloading not allowed.")
+    # YouTube is gated behind ALLOW_YOUTUBE=true (default false) — see Config
+    if not Config.ALLOW_YOUTUBE and (
+        "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    ):
+        raise HTTPException(status_code=403, detail="YouTube downloading not allowed (set ALLOW_YOUTUBE=true to enable).")
 
     from plugins.helper.upload import fetch_ytdlp_formats
 
@@ -149,8 +152,11 @@ async def api_download(req: DownloadRequest):
     if not url or not req.chat_id:
         raise HTTPException(status_code=400, detail="URL or chat_id missing.")
 
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        raise HTTPException(status_code=403, detail="YouTube downloading not allowed.")
+    # YouTube is gated behind ALLOW_YOUTUBE=true (default false) — see Config
+    if not Config.ALLOW_YOUTUBE and (
+        "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    ):
+        raise HTTPException(status_code=403, detail="YouTube downloading not allowed (set ALLOW_YOUTUBE=true to enable).")
 
     from plugins.commands import trigger_webapp_download
 
@@ -208,6 +214,37 @@ async def api_progress(user_id: int):
         return progress_data
     else:
         return {"action": "idle", "percentage": 0}
+
+
+# ── Adsgram Reward Postback ───────────────────────────────────────────────────
+# Adsgram fires a server-to-server GET to your reward URL after a rewarded ad
+# finishes, replacing [userId] with the user's Telegram ID.
+# Reference: https://adsgram.ai/blog/adsgram/telegram-mini-app-tma-development-mistakes-and-how-to-avoid-them
+#   - Must accept HTTPS GET on port 443
+#   - Must include the [userId] placeholder in the dashboard
+#   - Does NOT fire in debug mode
+#   - Available for apps above 50,000 daily average users
+#
+# Set in Adsgram dashboard as:
+#   https://telegram-url-uploader-x3u8.onrender.com/api/adsgram/reward?userid=[userId]
+
+
+@app.get("/api/adsgram/reward")
+async def adsgram_reward(userid: int = Query(..., description="Telegram user ID, injected by Adsgram")):
+    """
+    Receive Adsgram's reward postback.
+
+    We don't currently track per-user credits, so this endpoint just
+    acknowledges the postback with 200 OK and logs it for analytics.
+    If you want to grant the user a benefit (priority queue, skip next
+    interstitial, etc.), wire that up here.
+    """
+    Config.LOGGER.info(f"💰 Adsgram reward postback received for user {userid}")
+    # Future: increment a credit counter, push a notification via bot, etc.
+    return JSONResponse(
+        status_code=200,
+        content={"status": "ok", "userid": userid, "rewarded": True},
+    )
 
 
 # ── Sniffer API Compatibility (link-api) ──────────────────────────────────────

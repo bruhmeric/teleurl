@@ -66,6 +66,27 @@ class Config:
     )
     ADSGRAM_BLOCK_ID = os.environ.get("ADSGRAM_BLOCK_ID", "int-23574")
 
+    # ── Ad / sponsor removal ───────────────────────────
+    # Comma-separated list of SponsorBlock categories to strip out of the
+    # downloaded file. "default" = sponsor, selfpromo, interaction, intro,
+    # outro, preview, music_offtopic. Set to "" or "none" to disable.
+    # See https://github.com/yt-dlp/yt-dlp#sponsorblock-options
+    SPONSORBLOCK_REMOVE: str = os.environ.get(
+        "SPONSORBLOCK_REMOVE", "default"
+    )
+    # Optional custom SponsorBlock API endpoint (defaults to the public one).
+    SPONSORBLOCK_API: str = os.environ.get("SPONSORBLOCK_API", "")
+
+    # ── YouTube policy ─────────────────────────────────
+    # The Mini App endpoints (/api/formats, /api/download) currently block
+    # YouTube to keep the bot on the safe side of ToS. Set ALLOW_YOUTUBE=true
+    # to enable YouTube downloads through the bot. Make sure you have a
+    # valid cookies.txt and that you comply with YouTube's ToS in your
+    # jurisdiction before enabling this.
+    ALLOW_YOUTUBE: bool = _str_to_bool(
+        os.environ.get("ALLOW_YOUTUBE", "false"), default=False
+    )
+
     # ── Render / PaaS deployment knobs ────────────────
     # Render injects PORT; fall back to 8080 for local dev.
     PORT: int = int(os.environ.get("PORT", 8080) or 8080)

@@ -21,6 +21,30 @@ PROGRESS_UPDATE_DELAY = 1  # seconds between progress edits
 # Replaced by Config.WEBAPP_PROGRESS for thread-safe singleton access
 
 
+async def _safe_request(session, method: str, url: str, *, timeout: float = 15, **kwargs):
+    """
+    Issue an aiohttp request wrapped in asyncio.wait_for().
+
+    WHY: aiohttp's built-in `timeout=` parameter uses asyncio's timeout
+    context manager, which requires the call to be running inside an
+    asyncio Task. When the call originates from FastAPI's threadpool
+    (run_in_threadpool) or from a non-Task coroutine, aiohttp raises:
+        RuntimeError: Timeout context manager should be used inside a task
+    asyncio.wait_for() wraps the whole awaitable in a Task itself, so it
+    works in *any* async context — including threadpool dispatch from
+    FastAPI endpoints.
+
+    Returns the same _RequestContextManager that session.get/post/... returns,
+    so callers can still use `async with await _safe_request(...) as resp:`.
+    """
+    coro = getattr(session, method)(url, **kwargs)
+    # asyncio.wait_for on a non-Task awaitable wraps it in a Task internally,
+    # so the timeout context manager inside aiohttp will then find a current
+    # task and work correctly. The returned object is still the
+    # _RequestContextManager, so callers can use it as `async with`.
+    return await asyncio.wait_for(coro, timeout=timeout)
+
+
 
 def _get_ffmpeg_bin() -> str:
     """Return the actual ffmpeg binary path, checking FFMPEG_PATH and PATH."""
@@ -83,25 +107,27 @@ async def probe_file_size(url: str) -> int | None:
     session = await get_http_session()
     # 1. Try HEAD first
     try:
-        async with session.head(
-            url, allow_redirects=True, 
-            timeout=aiohttp.ClientTimeout(total=8),
-            proxy=Config.PROXY
+        async with await _safe_request(
+            session, "head", url,
+            allow_redirects=True,
+            timeout=8,
+            proxy=Config.PROXY,
         ) as head:
             cl = head.headers.get("Content-Length")
             if cl and cl.isdigit():
                 return int(cl)
     except Exception:
         pass
-        
+
     # 2. Try GET with Range: bytes=0-0 (Fallback for servers blocking HEAD)
     try:
         headers = {"Range": "bytes=0-0"}
-        async with session.get(
-            url, allow_redirects=True,
+        async with await _safe_request(
+            session, "get", url,
+            allow_redirects=True,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=8),
-            proxy=Config.PROXY
+            timeout=8,
+            proxy=Config.PROXY,
         ) as resp:
             # Look at Content-Range header: bytes 0-0/TOTAL_SIZE
             cr = resp.headers.get("Content-Range")
@@ -125,11 +151,11 @@ async def resolve_url(url: str) -> str:
         for _ in range(2): # 2 retries
             try:
                 session = await get_http_session()
-                async with session.head(
-                    url, 
-                    allow_redirects=True, 
-                    timeout=10, 
-                    proxy=Config.PROXY
+                async with await _safe_request(
+                    session, "head", url,
+                    allow_redirects=True,
+                    timeout=10,
+                    proxy=Config.PROXY,
                 ) as resp:
                     url = str(resp.url)
                     break
@@ -143,17 +169,17 @@ async def resolve_url(url: str) -> str:
             for _ in range(2):
                 try:
                     session = await get_http_session()
-                    async with session.head(
-                        url, 
-                        allow_redirects=True, 
-                        timeout=10, 
-                        proxy=Config.PROXY
+                    async with await _safe_request(
+                        session, "head", url,
+                        allow_redirects=True,
+                        timeout=10,
+                        proxy=Config.PROXY,
                     ) as resp:
                         url = str(resp.url)
                         break
                 except Exception:
                     await asyncio.sleep(1)
-                
+
         # Now Check for twitter.com / x.com and try vxtwitter API
         match = re.search(r'(?:twitter\.com|x\.com)/(?:[^/]+/status/|status/|status/|/)([0-9]+)', url, re.IGNORECASE)
         if match:
@@ -162,7 +188,11 @@ async def resolve_url(url: str) -> str:
             for _ in range(2):
                 try:
                     session = await get_http_session()
-                    async with session.get(api_url, timeout=10, proxy=Config.PROXY) as resp:
+                    async with await _safe_request(
+                        session, "get", api_url,
+                        timeout=10,
+                        proxy=Config.PROXY,
+                    ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             media_urls = data.get("mediaURLs", [])
@@ -345,7 +375,11 @@ async def fetch_external_api(url: str) -> str | None:
     Config.LOGGER.info(f"Trying external fallback API for: {url}")
     try:
         session = await get_http_session()
-        async with session.get(api_url, params={"url": url}, timeout=60) as resp:
+        async with await _safe_request(
+            session, "get", api_url,
+            params={"url": url},
+            timeout=60,
+        ) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("best_link")
@@ -372,12 +406,16 @@ async def external_extract_ytdlp(url: str) -> dict | None:
     api_url = f"{api_url.rstrip('/')}/extract"
     try:
         session = await get_http_session()
-        async with session.post(api_url, json={"url": url}, timeout=60) as resp:
+        async with await _safe_request(
+            session, "post", api_url,
+            json={"url": url},
+            timeout=60,
+        ) as resp:
             if resp.status == 200:
                 return await resp.json()
     except Exception:
         pass
-        
+
     return None
 
 
@@ -478,10 +516,11 @@ async def fetch_http_filename(url: str, default_name: str = "downloaded_file") -
     }
     try:
         session = await get_http_session()
-        async with session.head(
-            url, allow_redirects=True,
-            timeout=aiohttp.ClientTimeout(total=10),
-            proxy=Config.PROXY
+        async with await _safe_request(
+            session, "head", url,
+            allow_redirects=True,
+            timeout=10,
+            proxy=Config.PROXY,
         ) as head:
             mime = head.headers.get("Content-Type", "").split(";")[0].strip()
             cd = head.headers.get("Content-Disposition", "")
@@ -602,10 +641,11 @@ async def fetch_ytdlp_formats(url: str) -> dict:
                 for f_dict in format_results:
                     if f_dict.get("filesize") is None and f_dict.get("url"):
                         try:
-                            async with session.head(
-                                f_dict["url"], allow_redirects=True, 
-                                timeout=aiohttp.ClientTimeout(total=5),
-                                proxy=Config.PROXY
+                            async with await _safe_request(
+                                session, "head", f_dict["url"],
+                                allow_redirects=True,
+                                timeout=5,
+                                proxy=Config.PROXY,
                             ) as head:
                                 cl = head.headers.get("Content-Length")
                                 if cl and cl.isdigit():
@@ -979,6 +1019,15 @@ async def download_ytdlp(
         }
     }
 
+    # ── SponsorBlock: strip ad/sponsor segments from the downloaded file ───
+    # Controlled by Config.SPONSORBLOCK_REMOVE (default "default" categories).
+    # yt-dlp silently ignores SponsorBlock for extractors that don't support it.
+    _sblk = (getattr(Config, "SPONSORBLOCK_REMOVE", "default") or "").strip().lower()
+    if _sblk and _sblk not in ("none", "off", "false", "0"):
+        ydl_opts["sponsorblock_remove"] = _sblk
+    if getattr(Config, "SPONSORBLOCK_API", ""):
+        ydl_opts["sponsorblock_api"] = Config.SPONSORBLOCK_API
+
     # Additional logic for NSFW/Blocked sites
     if "pornhub.com" in url.lower():
         ydl_opts["http_headers"] = {"Referer": "https://www.pornhub.com/"}
@@ -1148,12 +1197,13 @@ async def download_cobalt(
 
         session = await get_http_session()
         # Step 1: Ask cobalt for the download URL
-        async with session.post(
+        async with await _safe_request(
+            session, "post",
             f"{api_url}/",
             json=payload,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=30),
-            proxy=Config.PROXY
+            timeout=30,
+            proxy=Config.PROXY,
         ) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
@@ -1292,31 +1342,72 @@ async def get_video_metadata(file_path: str) -> dict:
 
 async def generate_video_thumbnail(file_path: str, chat_id: int, duration: int = 0) -> str | None:
     """
-    Extract a single frame from the video at 10% of its duration (or 1 s if unknown),
-    scaled to max width 320 px, saved as JPEG.  Returns the path or None on failure.
+    Extract a representative frame from the video and save as a 320px-wide JPEG.
+
+    Strategy (tries multiple timestamps because many videos start with a
+    black/intro frame or a static title card):
+      1. 1s in (skips pure black intros)
+      2. 10 % of duration (mid-video, usually a real frame)
+      3. 25 % of duration (fallback)
+      4. ffmpeg's `thumbnail` filter (picks the most representative frame
+         automatically — last resort for short/odd videos)
+
+    Returns the path on success, or None on failure.
     """
     thumb_path = os.path.join(Config.DOWNLOAD_LOCATION, f"thumb_auto_{chat_id}.jpg")
-    # Pick a timestamp: 0 seconds (first frame) to avoid any seeking overhead and instantly grab the screen
-    seek = 0
+
+    # Build a list of seek positions to try
+    seeks = [1.0]
+    if duration and duration > 5:
+        seeks.append(round(duration * 0.10, 2))
+        seeks.append(round(duration * 0.25, 2))
+    # Deduplicate while preserving order
+    seen = set()
+    seeks = [s for s in seeks if not (s in seen or seen.add(s))]
+
+    for seek in seeks:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _get_ffmpeg_bin(),
+                "-y",
+                "-threads", "1",
+                "-ss", str(seek),
+                "-i", file_path,
+                "-vframes", "1",
+                "-vf", "scale=320:-1",
+                "-q:v", "2",          # JPEG quality (2 = very high, 31 = worst)
+                thumb_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+            if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+                return thumb_path
+        except Exception:
+            # Try next seek position
+            continue
+
+    # Last resort: ffmpeg's `thumbnail` filter (picks the most
+    # representative frame from the first ~100 frames automatically).
     try:
         proc = await asyncio.create_subprocess_exec(
             _get_ffmpeg_bin(),
             "-y",
             "-threads", "1",
-            "-ss", str(seek),
             "-i", file_path,
             "-vframes", "1",
-            "-vf", "scale=320:-1",
-            "-q:v", "2",          # JPEG quality (2 = very high, 31 = worst)
+            "-vf", "thumbnail,scale=320:-1",
+            "-q:v", "2",
             thumb_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=60)
+        await asyncio.wait_for(proc.communicate(), timeout=90)
         if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
             return thumb_path
     except Exception:
         pass
+
     return None
 
 
@@ -1569,10 +1660,11 @@ async def download_url(url: str, filename: str, progress_msg, start_time_ref: li
 
     # ── Probe the URL to detect content type ─────────────────────────────────
     session = await get_http_session()
-    async with session.head(
-        url, allow_redirects=True,
-        timeout=aiohttp.ClientTimeout(total=30),
-        proxy=Config.PROXY
+    async with await _safe_request(
+        session, "head", url,
+        allow_redirects=True,
+        timeout=30,
+        proxy=Config.PROXY,
     ) as head:
         mime = head.headers.get("Content-Type", "").lower().split(";")[0].strip()
         total_str = head.headers.get("Content-Length", "0")

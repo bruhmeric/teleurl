@@ -1,56 +1,47 @@
-# Render.com Blueprint — deploy with: Render Dashboard -> New -> Blueprint
-# (select the repo containing this file), then fill in the secret values
-# when prompted.  See README.md "Deploy on Render.com" for the full walkthrough.
+# ─────────────────────────────────────────────────────────────────────────────
+# Render Blueprint — minimal & maximally compatible
+# Docs: https://render.com/docs/blueprint-spec
 #
-# FREE TIER NOTES (default below):
-#   * The instance sleeps after ~15 min without INBOUND http traffic -> the
-#     bot pauses polling.  Keep it awake with a free uptime pinger
-#     (UptimeRobot / cron-job.org) hitting https://<service>.onrender.com/
-#     every 10 minutes, or upgrade the plan.
-#   * The filesystem is EPHEMERAL: vault.db is wiped on every deploy/restart.
-#     For a real vault, switch plan to "starter" and uncomment the disk block
-#     plus the DB_PATH env var below (disks need a paid instance).
+# This is intentionally minimal. After the service is created, add your
+# secret env vars (BOT_TOKEN, API_ID, API_HASH, OWNER_ID, DATABASE_URL,
+# LOG_CHANNEL) in Render's Environment tab.
+#
+# WEBAPP_URL is auto-detected from Render's RENDER_EXTERNAL_URL — no action
+# needed. PORT is auto-injected by Render. RENDER=true is auto-injected.
+# ─────────────────────────────────────────────────────────────────────────────
 services:
   - type: web
-    name: zk-image-vault
-    runtime: python
+    name: telegram-url-uploader
+    runtime: docker
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    healthCheckPath: /
     autoDeploy: true
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.12.4"
-      # ---- secrets: fill these in the Render dashboard (sync: false) ----
+      # Optional tunables — feel free to delete or change
+      - key: ALLOW_BOT_URL_UPLOAD
+        value: "true"
+      - key: FFMPEG_PATH
+        value: "/usr/bin/ffmpeg"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: KEEP_ALIVE_INTERVAL
+        value: "600"
+      - key: ENABLE_PLAYWRIGHT
+        value: "false"
+      - key: ENABLE_PO_TOKEN_SERVER
+        value: "false"
+      - key: ENABLE_ARIA2
+        value: "false"
+      # Secrets — Render will prompt you to fill these in the dashboard
+      # after sync. Leave value empty.
       - key: BOT_TOKEN
         sync: false
-      - key: MASTER_PASSPHRASE
+      - key: API_ID
         sync: false
-      - key: CHANNEL_ID
+      - key: API_HASH
         sync: false
       - key: OWNER_ID
         sync: false
-      - key: ALLOWED_USER_IDS
+      - key: DATABASE_URL
         sync: false
-      # ---- behaviour ----
-      - key: ALLOW_CHANNEL_MEMBERS
-        value: "1"
-      - key: SPOILER_ON_GET
-        value: "1"
-      - key: WATERMARK_ZK
-        value: "1"
-      - key: VIEW_TTL_SECONDS
-        value: "60"
-      - key: LINK_TTL_SECONDS
-        value: "600"
-      # BASE_URL is auto-detected from RENDER_EXTERNAL_URL (https is built in),
-      # so /secret zero-knowledge links work out of the box.
-      # ---- persistent vault (PAID: switch plan to "starter" and uncomment) ----
-      # disk:
-      #   name: vault-data
-      #   mountPath: /var/data
-      #   sizeGB: 1
-      # and add this env var:
-      # - key: DB_PATH
-      #   value: /var/data/vault.db
+      - key: LOG_CHANNEL
+        sync: false

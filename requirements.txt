@@ -1,7 +1,24 @@
-aiogram>=3.13,<4
-aiohttp>=3.9
-argon2-cffi>=23.1
-cryptography>=42.0
-Pillow>=10.3
-aiosqlite>=0.20
-python-dotenv>=1.0
+# URL Uploader Bot — Python dependencies
+# Pinned to versions known to work with pyroblack and the Render Dockerfile.
+fastapi>=0.110,<0.115
+uvicorn[standard]>=0.29,<0.31
+pydantic>=2.6,<3
+httpx
+python-multipart
+pyroblack>=2.3
+tgcrypto
+aiohttp==3.9.5
+aiofiles==23.2.1
+motor==3.4.0
+pymongo==4.7.3
+dnspython==2.6.1
+psutil==5.9.8
+filetype==1.2.0
+Pillow==10.3.0
+requests==2.32.3
+yt-dlp
+python-dotenv==1.0.1
+aria2p
+waitress==3.0.0
+# Optional — uncomment for local dev if you want Playwright:
+# playwright
