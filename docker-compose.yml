@@ -1,0 +1,12 @@
+services:
+  zk-vault-bot:
+    build: .
+    container_name: zk-vault-bot
+    env_file: .env
+    environment:
+      - DB_PATH=/data/vault.db
+    volumes:
+      - ./data:/data          # the encrypted vault lives here (and ONLY here)
+    ports:
+      - "8080:8080"           # zero-knowledge viewer; reverse-proxy with TLS
+    restart: unless-stopped
