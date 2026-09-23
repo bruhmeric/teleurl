@@ -4,6 +4,18 @@ import sys
 import threading
 import asyncio
 import time
+
+# ── CRITICAL: pin a single asyncio event loop BEFORE any pyrogram import ──
+# Pyrogram's Client.__init__ captures asyncio.get_event_loop() at instantiation
+# time (utils/shared.py creates the Client at import time). If we later use
+# asyncio.run(main()) it creates a *new* loop, and pyrogram's executor ends
+# up bound to the old one → "Future attached to a different loop" RuntimeError.
+#
+# Fix: create and set the event loop explicitly here, then later run main() on
+# the SAME loop with loop.run_until_complete() instead of asyncio.run().
+_MAIN_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_MAIN_LOOP)
+
 from plugins.config import Config
 import platform
 import zipfile
@@ -213,11 +225,24 @@ if __name__ == "__main__":
         await bot_client.stop()
 
     # Run everything manually since we want more control over start/stop
+    # NOTE: we use the pinned loop from module top (not asyncio.run, which
+    # would create a NEW loop and trigger pyrogram's "Future attached to a
+    # different loop" error). See the comment at the top of this file.
     print("🎬 Starting event loop...")
     try:
-        asyncio.run(main())
+        _MAIN_LOOP.run_until_complete(main())
     except Exception as e:
         print(f"❌ Bot crashed: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        # Drain any pending callbacks before closing the loop
+        try:
+            _MAIN_LOOP.run_until_complete(_MAIN_LOOP.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            _MAIN_LOOP.close()
+        except Exception:
+            pass
