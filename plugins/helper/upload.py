@@ -1220,6 +1220,71 @@ async def download_ytdlp(
 
 # ── Cobalt API fallback ──────────────────────────────────────────────────────
 
+def _cobalt_endpoints() -> list:
+    """
+    Build the ordered list of cobalt API URLs to try.
+    Always tries Config.COBALT_API_URL first, then any URLs listed in
+    Config.COBALT_API_FALLBACKS. Empty entries are skipped silently.
+    """
+    urls = []
+    primary = (Config.COBALT_API_URL or "").rstrip()
+    if primary:
+        urls.append(primary.rstrip("/"))
+    for u in getattr(Config, "COBALT_API_FALLBACKS", []) or []:
+        u = u.rstrip()
+        if u and u not in urls:
+            urls.append(u.rstrip("/"))
+    return urls
+
+
+async def _cobalt_extract_one(
+    session,
+    api_url: str,
+    payload: dict,
+    headers: dict,
+    timeout: int = 30,
+) -> tuple[str, str]:
+    """
+    POST to one cobalt instance and return (download_url, filename).
+    Raises ValueError on any error, with a clear message including the
+    instance URL so the caller knows which one failed.
+    """
+    async with await _safe_request(
+        session, "post",
+        f"{api_url}/",
+        json=payload,
+        headers=headers,
+        timeout=timeout,
+        proxy=Config.PROXY,
+    ) as resp:
+        if resp.status != 200:
+            error_text = await resp.text()
+            raise ValueError(f"{api_url} returned {resp.status}: {error_text[:200]}")
+        data = await resp.json()
+
+        status = data.get("status")
+        if status == "error":
+            error_code = data.get("error", {}).get("code", "unknown")
+            raise ValueError(f"{api_url} extraction error: {error_code}")
+
+        if status in ("tunnel", "redirect"):
+            download_url_str = data.get("url")
+            cobalt_filename = data.get("filename") or ""
+        elif status == "picker":
+            picker = data.get("picker", [])
+            if not picker:
+                raise ValueError(f"{api_url}: no media found to extract")
+            download_url_str = picker[0].get("url")
+            cobalt_filename = ""
+        else:
+            raise ValueError(f"{api_url}: unexpected status: {status}")
+
+        if not download_url_str:
+            raise ValueError(f"{api_url}: empty download URL in response")
+
+        return download_url_str, cobalt_filename
+
+
 async def download_cobalt(
     url: str,
     filename: str,
@@ -1232,13 +1297,17 @@ async def download_cobalt(
     Download content using the cobalt API (fallback for Instagram/Pinterest).
     No cookies required — cobalt handles authentication independently.
     Returns (file_path, mime_type).
+
+    Tries Config.COBALT_API_URL first, then each URL in
+    Config.COBALT_API_FALLBACKS, until one succeeds. This makes the bot
+    resilient to a single cobalt instance going down (a common problem
+    with free-tier koyeb/railway instances that sleep when idle).
     """
     start_time_ref[0] = time.time()
     out_dir = Config.DOWNLOAD_LOCATION
     os.makedirs(out_dir, exist_ok=True)
     safe_stem = re.sub(r'[\\/*?"<>|:]', "_", os.path.splitext(filename)[0])[:80]
 
-    api_url = Config.COBALT_API_URL.rstrip("/")
     payload = {
         "url": url,
         "downloadMode": "auto",
@@ -1257,7 +1326,7 @@ async def download_cobalt(
             "📥 **Initializing Download…** ⏳\n_Please wait while we prepare your file..._",
             reply_markup=cancel_button(user_id)
         )
-        
+
         # Initial state for WebApp
         WEBAPP_PROGRESS[user_id] = {
             "action": "Requesting Extraction Server...",
@@ -1268,81 +1337,74 @@ async def download_cobalt(
         }
 
         session = await get_http_session()
-        # Step 1: Ask cobalt for the download URL
-        async with await _safe_request(
-            session, "post",
-            f"{api_url}/",
-            json=payload,
-            headers=headers,
-            timeout=30,
-            proxy=Config.PROXY,
-        ) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                raise ValueError(f"Download server returned {resp.status}: {error_text[:200]}")
-            data = await resp.json()
+        endpoints = _cobalt_endpoints()
+        if not endpoints:
+            raise ValueError("No cobalt API URL configured (set COBALT_API_URL)")
 
-            status = data.get("status")
-
-            if status == "error":
-                error_code = data.get("error", {}).get("code", "unknown")
-                raise ValueError(f"Extraction error: {error_code}")
-
-            # Get the download URL from the response
-            if status in ("tunnel", "redirect"):
-                download_url_str = data.get("url")
-                cobalt_filename = data.get("filename", f"{safe_stem}.mp4")
-            elif status == "picker":
-                # Multiple items — take the first video/photo
-                picker = data.get("picker", [])
-                if not picker:
-                    raise ValueError("No media found to extract")
-                download_url_str = picker[0].get("url")
-                cobalt_filename = f"{safe_stem}.mp4"
-            else:
-                raise ValueError(f"Download server returned unexpected status: {status}")
-
-            if not download_url_str:
-                raise ValueError("Could not extract media URL")
-
-            # Determine output file extension from cobalt filename
-            _, ext = os.path.splitext(cobalt_filename)
-            if not ext:
-                ext = ".mp4"
-            out_path = os.path.join(out_dir, f"{safe_stem}{ext}")
-
+        # Try each endpoint in order until one returns a valid download URL.
+        last_err = None
+        download_url_str = None
+        cobalt_filename = ""
+        for i, api_url in enumerate(endpoints):
             try:
-                # Step 2: Download extremely fast via aria2c using the Cobalt proxy URL
-                await _safe_edit(progress_msg, "📥 **Extracting Media…** ⚙️", reply_markup=cancel_button(user_id))
-                
-                # Transition state for WebApp
-                WEBAPP_PROGRESS[user_id] = {
-                    "action": "Starting Download...",
-                    "percentage": 10,
-                    "current": "0 B",
-                    "total": "Fetching...",
-                    "speed": "Waiting"
-                }
-
-                await _download_aria2c(download_url_str, out_path, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
-
-            except Exception:
-                if os.path.exists(out_path):
-                    try:
-                        os.remove(out_path)
-                    except Exception:
-                        pass
+                Config.LOGGER.info(f"[cobalt] trying {api_url} ({i+1}/{len(endpoints)})")
+                download_url_str, cobalt_filename = await _cobalt_extract_one(
+                    session, api_url, payload, headers, timeout=30,
+                )
+                if download_url_str:
+                    Config.LOGGER.info(f"[cobalt] success with {api_url}")
+                    break
+            except asyncio.CancelledError:
                 raise
+            except Exception as e:
+                last_err = e
+                Config.LOGGER.info(f"[cobalt] {api_url} failed: {e}")
+                continue
 
-            if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        if not download_url_str:
+            # All endpoints failed — surface the last error.
+            raise ValueError(
+                f"All cobalt endpoints failed. Last error: {last_err}"
+            )
+
+        # Determine output file extension from cobalt filename
+        _, ext = os.path.splitext(cobalt_filename) if cobalt_filename else ("", "")
+        if not ext:
+            ext = ".mp4"
+        out_path = os.path.join(out_dir, f"{safe_stem}{ext}")
+
+        try:
+            # Step 2: Download extremely fast via aria2c using the Cobalt proxy URL
+            await _safe_edit(progress_msg, "📥 **Extracting Media…** ⚙️", reply_markup=cancel_button(user_id))
+
+            # Transition state for WebApp
+            WEBAPP_PROGRESS[user_id] = {
+                "action": "Starting Download...",
+                "percentage": 10,
+                "current": "0 B",
+                "total": "Fetching...",
+                "speed": "Waiting"
+            }
+
+            await _download_aria2c(download_url_str, out_path, progress_msg, start_time_ref, user_id, cancel_ref=cancel_ref)
+
+        except Exception:
+            if os.path.exists(out_path):
                 try:
                     os.remove(out_path)
-                except:
+                except Exception:
                     pass
-                raise ValueError("Downloaded file from secondary server is empty (0 bytes).")
+            raise
 
-            mime = mimetypes.guess_type(out_path)[0] or "video/mp4"
-            return out_path, mime
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            try:
+                os.remove(out_path)
+            except:
+                pass
+            raise ValueError("Downloaded file from secondary server is empty (0 bytes).")
+
+        mime = mimetypes.guess_type(out_path)[0] or "video/mp4"
+        return out_path, mime
 
     except Exception as e:
         raise ValueError(f"Download failed: {e}")

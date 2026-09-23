@@ -55,9 +55,26 @@ class Config:
     SESSION_NAME: str = "url_uploader_bot"
 
     # ── External API endpoints ────────────────────────
+    # Cobalt API for social media downloads (Instagram, TikTok, Facebook, etc.).
+    # Default is the public `dwnld.nichind.dev` cluster, which is itself a
+    # meta-aggregator that tries ~17 internal cobalt instances and returns
+    # the first successful result. This is the most reliable free option.
+    # Override by setting COBALT_API_URL to your own self-hosted instance.
     COBALT_API_URL: str = os.environ.get(
-        "COBALT_API_URL", "https://arrogant-karrah-akila-4c42ca1e.koyeb.app"
+        "COBALT_API_URL", "https://dwnld.nichind.dev"
     )
+    # Comma-separated list of fallback cobalt URLs to try if the primary
+    # COBALT_API_URL fails. Example:
+    #   COBALT_API_FALLBACKS=https://cobalt-api.example1.com,https://cobalt-api.example2.com
+    # If empty, we auto-add the default `dwnld.nichind.dev` cluster as a
+    # fallback so the bot is resilient even if the primary URL is a dead
+    # koyeb/railway instance that sleeps when idle.
+    _user_fallbacks: list = [
+        u.strip() for u in os.environ.get("COBALT_API_FALLBACKS", "").split(",")
+        if u.strip()
+    ]
+    _default_fallbacks: list = ["https://dwnld.nichind.dev"]
+    COBALT_API_FALLBACKS: list = _user_fallbacks if _user_fallbacks else _default_fallbacks
     LINK_API_URL: str = os.environ.get(
         "LINK_API_URL", "https://native-serene-maduranga11-43790d26.koyeb.app"
     )
